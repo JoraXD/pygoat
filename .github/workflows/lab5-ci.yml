@@ -1,0 +1,80 @@
+name: Lab 5 CI
+on: [push, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  sast_scan:
+    name: Run Bandit Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install bandit==1.9.2
+      - name: Run Bandit Scan
+        run: bandit -ll -ii -r . -f json -o bandit-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bandit-findings
+          path: bandit-report.json
+  image_scan:
+    name: Build and Run Image Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker Image
+        run: docker build -f Dockerfile -t mytestapp:latest .
+      - name: Docker Scout Scan
+        uses: docker/scout-action@v1.15.1
+        with:
+          dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub-password: ${{ secrets.DOCKERHUB_PASSWORD }}
+          command: quickview,cves
+          image: local://mytestapp:latest
+          only-severities: critical,high
+          sarif-file: scout-report.sarif
+          exit-code: true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: docker-scout-findings
+          path: scout-report.sarif
+  dast_scan:
+    name: Run ZAP Baseline Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start PyGoat
+        run: |
+          docker network create lab5-net
+          docker pull pygoat/pygoat:latest
+          docker run --rm -d --name lab5-pygoat --network lab5-net -p 127.0.0.1:8000:8000 pygoat/pygoat:latest
+          ready=0
+          for attempt in $(seq 1 90); do
+            if curl --fail --silent http://127.0.0.1:8000/ > /dev/null; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = 1
+      - name: ZAP DAST
+        run: |
+          mkdir -p zap-reports
+          chmod 777 zap-reports
+          docker run --rm --network lab5-net -v "$PWD/zap-reports:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable zap-baseline.py -t http://lab5-pygoat:8000 -m 1 -T 5 -r zap-report.html -J zap-report.json -w zap-report.md
+      - name: App logs
+        if: always()
+        run: docker logs lab5-pygoat > zap-reports/app.log 2>&1 || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-findings
+          path: zap-reports/
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop lab5-pygoat || true
+          docker network rm lab5-net || true
